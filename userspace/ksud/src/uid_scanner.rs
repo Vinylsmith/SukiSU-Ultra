@@ -366,6 +366,12 @@ fn perform_scan_update(cfg: &ScannerConfig) {
 }
 
 pub fn run_daemon() -> Result<()> {
+    // Check if kernel flag is enabled before starting
+    if !is_kernel_enabled() {
+        info!("uid_scanner: kernel flag disabled, daemon will not start");
+        return Ok(());
+    }
+
     let dir = Path::new(USER_UID_BASE_DIR);
     ensure_directory_exists(dir)?;
 
@@ -392,16 +398,11 @@ pub fn run_daemon() -> Result<()> {
 
     let mut cfg = load_config().unwrap_or_default();
 
-    let mut kernel_enabled = is_kernel_enabled();
-
-    if kernel_enabled {
-        if cfg.auto_scan {
-            perform_scan_update(&cfg);
-        } else {
-            info!("uid_scanner: auto_scan disabled, waiting for manual or kernel requests");
-        }
+    // Perform initial scan if auto_scan is enabled
+    if cfg.auto_scan {
+        perform_scan_update(&cfg);
     } else {
-        info!("uid_scanner: kernel disabled, initial scan skipped");
+        info!("uid_scanner: auto_scan disabled, waiting for manual or kernel requests");
     }
 
     loop {
@@ -409,7 +410,12 @@ pub fn run_daemon() -> Result<()> {
         if let Ok(new_cfg) = load_config() {
             cfg = new_cfg;
         }
-        kernel_enabled = is_kernel_enabled();
+        
+        // Check if kernel disabled the scanner at runtime, exit if so
+        if !is_kernel_enabled() {
+            info!("uid_scanner: kernel flag disabled at runtime, daemon exiting");
+            break;
+        }
 
         // Check for kernel-initiated scan request via signal
         let kernel_request = KERNEL_SCAN_REQUEST.swap(false, Ordering::Relaxed);
@@ -417,12 +423,15 @@ pub fn run_daemon() -> Result<()> {
             info!("uid_scanner: kernel scan request received via signal");
         }
 
-        if kernel_enabled && (cfg.auto_scan || kernel_request) {
+        // Perform scan if auto_scan is enabled or kernel requested
+        if cfg.auto_scan || kernel_request {
             perform_scan_update(&cfg);
         }
 
         thread::sleep(Duration::from_secs(cfg.scan_interval_secs));
     }
+    
+    Ok(())
 }
 
 /// One-shot scan, intended for manual invocation from CLI/manager.

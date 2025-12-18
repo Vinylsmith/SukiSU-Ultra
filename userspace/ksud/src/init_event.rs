@@ -3,12 +3,66 @@ use crate::kpm;
 use crate::module::{handle_updated_modules, prune_modules};
 use crate::utils::is_safe_mode;
 use crate::{
-    assets, defs, ksucalls, metamodule, restorecon,
+    assets, defs, ksucalls, metamodule, restorecon, uid_scanner,
     utils::{self},
 };
 use anyhow::{Context, Result};
 use log::{info, warn};
 use std::path::Path;
+use std::process::Command;
+use std::os::unix::process::CommandExt;
+use std::process::Stdio;
+use std::fs::File;
+use std::io::Read;
+
+fn is_uid_scanner_enabled() -> bool {
+    let state_path = "/data/adb/ksu/user_uid/.state";
+    let mut buf = [0u8; 1];
+
+    match File::open(state_path).and_then(|mut f| f.read_exact(&mut buf)) {
+        Ok(()) => buf[0] == b'1',
+        Err(_) => false,
+    }
+}
+
+fn spawn_uid_scanner_daemon() -> Result<()> {
+    // Check if uid_scanner is enabled before spawning
+    if !is_uid_scanner_enabled() {
+        info!("uid_scanner: disabled by kernel flag, skip daemon spawn");
+        return Ok(());
+    }
+
+    info!("Spawning uid_scanner daemon as independent process");
+
+    let ksud_path = std::env::current_exe()
+        .with_context(|| "failed to get current executable path")?;
+
+    let result = unsafe {
+        Command::new(&ksud_path)
+            .arg("uid-scanner")
+            .arg("daemon")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .pre_exec(|| {
+                utils::switch_cgroups();
+                Ok(())
+            })
+            .spawn()
+    };
+
+    match result {
+        Ok(child) => {
+            info!("uid_scanner daemon spawned successfully (pid={})", child.id());
+            Ok(())
+        }
+        Err(e) => {
+            warn!("Failed to spawn uid_scanner daemon: {e}");
+            Err(e).with_context(|| "failed to spawn uid_scanner daemon")
+        }
+    }
+}
 
 pub fn on_post_data_fs() -> Result<()> {
     ksucalls::report_post_fs_data();
@@ -129,6 +183,9 @@ fn run_stage(stage: &str, block: bool) {
         warn!("Magisk detected, skip {stage}");
         return;
     }
+
+    // Start uid_scanner daemon as independent process
+    spawn_uid_scanner_daemon()?;
 
     if crate::utils::is_safe_mode() {
         warn!("safe mode, skip {stage} scripts");
